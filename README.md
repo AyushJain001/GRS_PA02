@@ -110,4 +110,4 @@ sudo ./setup_namespaces.sh setup && sudo ./MT25066_Part_C_Experiment.sh && pytho
 - **Assignment**: PA02
 
 ## GitHub Repository
-https://github.com/[YOUR_USERNAME]/GRS_PA02
+https://github.com/AyushJain001/GRS_PA02
