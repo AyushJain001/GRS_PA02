@@ -18,6 +18,9 @@ HEADER="impl,msg_size,threads,throughput_gbps,avg_latency_us,cycles,l1_misses,ll
 
 echo "$HEADER" > "${ROLL}_Part_C_Summary.csv"
 
+# Global port counter for unique ports
+CURRENT_PORT=$PORT_BASE
+
 parse_perf_value() {
     local file="$1"
     local event="$2"
@@ -43,7 +46,10 @@ run_one() {
     local client_bin="$3"
     local msg_size="$4"
     local threads="$5"
-    local port=$((PORT_BASE + threads % 10))
+    
+    # Use unique port for each run and increment
+    CURRENT_PORT=$((CURRENT_PORT + 1))
+    local port=$CURRENT_PORT
 
     local perf_out="${ROLL}_Part_C_${impl}_${msg_size}_${threads}.perf"
     local csv_out="${ROLL}_Part_C_${impl}_${msg_size}_${threads}.csv"
@@ -55,7 +61,7 @@ run_one() {
     # Run server in server namespace
     sudo ip netns exec $SERVER_NS timeout $TIMEOUT_SEC $(pwd)/$server_bin "$port" "$msg_size" > /dev/null 2>&1 &
     local server_pid=$!
-    sleep 0.5
+    sleep 1
 
     set +e
     local client_output
@@ -71,7 +77,7 @@ run_one() {
 
     sudo kill $server_pid >/dev/null 2>&1 || true
     wait $server_pid >/dev/null 2>&1 || true
-    sleep 0.2
+    sleep 1
 
     local throughput="0"
     local latency="0"
@@ -92,7 +98,7 @@ run_one() {
     echo "$impl,$msg_size,$threads,$throughput,$latency,$cycles,$l1_misses,$llc_misses,$ctx_switches" >> "$csv_out"
 }
 
-cd /home/iiitd/Desktop/PA_02/GRS_PA02 || exit 1
+cd "$(dirname "$0")" || exit 1
 
 echo "=========================================="
 echo "MT25066 - PA02 Experiment Runner"
