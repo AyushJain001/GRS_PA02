@@ -102,6 +102,8 @@ python3 MT25066_Part_D_Plots.py
 sudo ./setup_namespaces.sh cleanup
 ```
 
+sudo ./setup_namespaces.sh setup && sudo ./MT25066_Part_C_Experiment.sh && python3 MT25066_Part_D_Plots.py
+
 ## Author
 - **Roll Number**: MT25066
 - **Course**: Graduate Systems (GRS)
