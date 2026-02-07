@@ -1,0 +1,210 @@
+#include "MT25066_Part_A_Common.h"
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <linux/errqueue.h>
+#include <netinet/in.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+typedef struct {
+    int client_fd;
+    size_t msg_size;
+} mt25066_client_ctx_t;
+
+static volatile sig_atomic_t mt25066_stop = 0;
+
+static void mt25066_on_sigint(int sig) {
+    (void)sig;
+    mt25066_stop = 1;
+}
+
+static void mt25066_drain_zerocopy(int fd) {
+    char control[CMSG_SPACE(sizeof(struct sock_extended_err))];
+    struct iovec iov;
+    char data[1];
+    struct msghdr msg;
+
+    memset(&msg, 0, sizeof(msg));
+    memset(control, 0, sizeof(control));
+    iov.iov_base = data;
+    iov.iov_len = sizeof(data);
+
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
+
+    while (1) {
+        ssize_t ret = recvmsg(fd, &msg, MSG_ERRQUEUE | MSG_DONTWAIT);
+        if (ret < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            }
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+    }
+}
+
+static void *mt25066_client_thread(void *arg) {
+    mt25066_client_ctx_t *ctx = (mt25066_client_ctx_t *)arg;
+    int fd = ctx->client_fd;
+    size_t msg_size = ctx->msg_size;
+
+    mt25066_set_nodelay(fd);
+
+    int zc = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_ZEROCOPY, &zc, sizeof(zc)) != 0) {
+        fprintf(stderr, "Warning: SO_ZEROCOPY not supported on this socket.\n");
+    }
+
+    mt25066_message_t *msg = mt25066_message_create(msg_size);
+    if (!msg) {
+        close(fd);
+        free(ctx);
+        return NULL;
+    }
+    mt25066_message_fill(msg, 0x7F);
+
+    struct iovec *iov = mt25066_message_iov(msg);
+    if (!iov) {
+        mt25066_message_destroy(msg);
+        close(fd);
+        free(ctx);
+        return NULL;
+    }
+
+    char *recv_buf = (char *)malloc(msg_size);
+    if (!recv_buf) {
+        free(iov);
+        mt25066_message_destroy(msg);
+        close(fd);
+        free(ctx);
+        return NULL;
+    }
+
+    struct msghdr msg_hdr;
+    memset(&msg_hdr, 0, sizeof(msg_hdr));
+    msg_hdr.msg_iov = iov;
+    msg_hdr.msg_iovlen = MT25066_FIELDS;
+
+    uint64_t send_count = 0;
+
+    while (!mt25066_stop) {
+        ssize_t recvd = mt25066_recv_all(fd, recv_buf, msg_size);
+        if (recvd <= 0) {
+            break;
+        }
+
+        ssize_t sent = sendmsg(fd, &msg_hdr, MSG_ZEROCOPY);
+        if (sent < 0) {
+            if (errno == EOPNOTSUPP || errno == ENOTSUP) {
+                sent = sendmsg(fd, &msg_hdr, 0);
+                if (sent < 0) {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        send_count++;
+        if ((send_count % 32) == 0) {
+            mt25066_drain_zerocopy(fd);
+        }
+    }
+
+    mt25066_drain_zerocopy(fd);
+
+    free(recv_buf);
+    free(iov);
+    mt25066_message_destroy(msg);
+    close(fd);
+    free(ctx);
+    return NULL;
+}
+
+int main(int argc, char **argv) {
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <port> <message_size>\n", argv[0]);
+        return 1;
+    }
+
+    int port = atoi(argv[1]);
+    size_t msg_size = (size_t)strtoul(argv[2], NULL, 10);
+    if (port <= 0 || msg_size == 0) {
+        fprintf(stderr, "Invalid port or message size.\n");
+        return 1;
+    }
+
+    signal(SIGINT, mt25066_on_sigint);
+
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        perror("socket");
+        return 1;
+    }
+
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons((uint16_t)port);
+
+    if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind");
+        close(server_fd);
+        return 1;
+    }
+
+    if (listen(server_fd, 128) < 0) {
+        perror("listen");
+        close(server_fd);
+        return 1;
+    }
+
+    fprintf(stdout, "A3 Server listening on port %d (msg_size=%zu)\n", port, msg_size);
+
+    while (!mt25066_stop) {
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+        if (client_fd < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("accept");
+            break;
+        }
+
+        mt25066_client_ctx_t *ctx = (mt25066_client_ctx_t *)calloc(1, sizeof(mt25066_client_ctx_t));
+        if (!ctx) {
+            close(client_fd);
+            continue;
+        }
+        ctx->client_fd = client_fd;
+        ctx->msg_size = msg_size;
+
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, mt25066_client_thread, ctx) != 0) {
+            close(client_fd);
+            free(ctx);
+            continue;
+        }
+        pthread_detach(tid);
+    }
+
+    close(server_fd);
+    return 0;
+}
